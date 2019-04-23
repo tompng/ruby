@@ -1778,6 +1778,12 @@ rb_iseq_clear_event_flags(const rb_iseq_t *iseq, size_t pos, rb_event_flag_t res
 }
 
 static VALUE
+rb_non_internal_id2str(ID id) {
+    if ((id & ID_INTERNAL) == ID_INTERNAL) return 0;
+    return rb_id2str(id);
+}
+
+static VALUE
 local_var_name(const rb_iseq_t *diseq, VALUE level, VALUE op)
 {
     VALUE i;
@@ -1790,7 +1796,7 @@ local_var_name(const rb_iseq_t *diseq, VALUE level, VALUE op)
     }
     idx = diseq->body->local_table_size - (int)op - 1;
     lid = diseq->body->local_table[idx];
-    name = rb_id2str(lid);
+    name = rb_non_internal_id2str(lid);
     if (!name) {
 	name = rb_str_new_cstr("?");
     }
@@ -2606,7 +2612,7 @@ iseq_data_to_ary(const rb_iseq_t *iseq)
     for (i=0; i<iseq_body->local_table_size; i++) {
 	ID lid = iseq_body->local_table[i];
 	if (lid) {
-	    if (rb_id2str(lid)) {
+	    if (rb_non_internal_id2str(lid)) {
 		rb_ary_push(locals, ID2SYM(lid));
 	    }
 	    else { /* hidden variable from id_internal() */
@@ -2885,7 +2891,7 @@ rb_iseq_parameters(const rb_iseq_t *iseq, int is_proc)
 #define PARAM_ID(i) body->local_table[(i)]
 #define PARAM(i, type) (		      \
 	PARAM_TYPE(type),		      \
-	rb_id2str(PARAM_ID(i)) ?	      \
+	rb_non_internal_id2str(PARAM_ID(i)) ? \
 	rb_ary_push(a, ID2SYM(PARAM_ID(i))) : \
 	a)
 
@@ -2894,7 +2900,7 @@ rb_iseq_parameters(const rb_iseq_t *iseq, int is_proc)
     if (is_proc) {
 	for (i = 0; i < body->param.lead_num; i++) {
 	    PARAM_TYPE(opt);
-	    rb_ary_push(a, rb_id2str(PARAM_ID(i)) ? ID2SYM(PARAM_ID(i)) : Qnil);
+	    if (rb_non_internal_id2str(PARAM_ID(i))) rb_ary_push(a, ID2SYM(PARAM_ID(i)));
 	    rb_ary_push(args, a);
 	}
     }
