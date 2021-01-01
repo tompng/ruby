@@ -147,8 +147,15 @@ class TestTRICK2018 < Test::Unit::TestCase
   def test_03_tompng
     src = File.join(__dir__, "../sample/trick2018/03-tompng/entry.rb")
 
-    # only syntax check because it requires chunky_png
-    assert_in_out_err(["-W0", "-c", src], "", ["Syntax OK"])
+    eval_target_code_to_stdout = "def eval(code); puts code; end;"
+    assert_in_out_err(["-W0"], eval_target_code_to_stdout + File.read(src)) do |stdout, stderr, _status|
+      assert_empty stderr
+      eval_target_code = stdout.join("\n")
+      expected_code_size = 1146
+      assert_equal(expected_code_size, eval_target_code.size)
+       # only syntax check because it requires chunky_png
+      assert_in_out_err(["-W0", "-c"], eval_target_code, ["Syntax OK"])
+    end
   end
 
   def test_04_colin
@@ -185,7 +192,7 @@ END
   def test_05_tompng
     src = File.join(__dir__, "../sample/trick2018/05-tompng/entry.rb")
 
-    # only syntax check because it generates 3D model data
-    assert_in_out_err(["-W0", "-c", src], "", ["Syntax OK"])
+    overwrite_file_write = 'def File.write(f, data); puts "#{f}:#{data.lines.size}"; end;'
+    assert_in_out_err(["-W0"], overwrite_file_write + File.read(src), ["wine_glass.stl:14338"])
   end
 end
