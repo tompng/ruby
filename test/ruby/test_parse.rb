@@ -1609,6 +1609,24 @@ x = __ENCODING__
     assert_ractor_shareable(a[0])
   end
 
+  def test_shareable_constant_value_hash_with_keyword_splat
+    a, b = eval_separately("#{<<~"begin;"}\n#{<<~'end;'}")
+    begin;
+      # shareable_constant_value: experimental_everything
+      x = { x: {} }
+      y = { y: {} }
+      A = { **x }
+      B = { x: 1, **y }
+      [A, B]
+    end;
+    assert_ractor_shareable(a)
+    assert_ractor_shareable(b)
+    assert_equal({ x: {}}, a)
+    assert_equal({ x: 1, y: {}}, b)
+  rescue NotImplementedError
+    # Skip prism
+  end
+
   def test_shareable_constant_value_unshareable_literal
     assert_raise_separately(Ractor::IsolationError, /unshareable object to C/,
                             "#{<<~"begin;"}\n#{<<~'end;'}")
