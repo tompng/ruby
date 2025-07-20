@@ -162,6 +162,9 @@ STATIC_ASSERT(sizeof_long_and_sizeof_bdigit, SIZEOF_BDIGIT % SIZEOF_LONG == 0);
 #define KARATSUBA_MUL_DIGITS 70
 #define TOOM3_MUL_DIGITS 150
 
+#define NEWTON_RAPHSON_DIV_X_DIGITS 1200
+#define NEWTON_RAPHSON_DIV_Y_DIGITS 200
+
 #define GMP_DIV_DIGITS 20
 #define GMP_BIG2STR_DIGITS 20
 #define GMP_STR2BIG_DIGITS 20
@@ -2772,8 +2775,8 @@ bary_divmod_normal(BDIGIT *qds, size_t qn, BDIGIT *rds, size_t rn, const BDIGIT 
         ALLOCV_END(tmpyz);
 }
 
-VALUE
-rb_big_divrem_normal(VALUE x, VALUE y)
+static VALUE
+rb_big_divrem_testing(VALUE x, VALUE y, bool large_qn, void(*bary_divmod_func)(BDIGIT*, size_t, BDIGIT*, size_t, const BDIGIT*, size_t, const BDIGIT*, size_t))
 {
     size_t xn = BIGNUM_LEN(x), yn = BIGNUM_LEN(y), qn, rn;
     BDIGIT *xds = BDIGITS(x), *yds = BDIGITS(y), *qds, *rds;
@@ -2787,7 +2790,7 @@ rb_big_divrem_normal(VALUE x, VALUE y)
     if (xn < yn || (xn == yn && xds[xn - 1] < yds[yn - 1]))
         return rb_assoc_new(LONG2FIX(0), x);
 
-    qn = xn + BIGDIVREM_EXTRA_WORDS;
+    qn = large_qn ? xn + BIGDIVREM_EXTRA_WORDS : xn - yn + BIGDIVREM_EXTRA_WORDS;
     q = bignew(qn, BIGNUM_SIGN(x)==BIGNUM_SIGN(y));
     qds = BDIGITS(q);
 
@@ -2795,7 +2798,7 @@ rb_big_divrem_normal(VALUE x, VALUE y)
     r = bignew(rn, BIGNUM_SIGN(x));
     rds = BDIGITS(r);
 
-    bary_divmod_normal(qds, qn, rds, rn, xds, xn, yds, yn);
+    bary_divmod_func(qds, qn, rds, rn, xds, xn, yds, yn);
 
     bigtrunc(q);
     bigtrunc(r);
@@ -2804,6 +2807,12 @@ rb_big_divrem_normal(VALUE x, VALUE y)
     RB_GC_GUARD(y);
 
     return rb_assoc_new(q, r);
+}
+
+VALUE
+rb_big_divrem_normal(VALUE x, VALUE y)
+{
+    return rb_big_divrem_testing(x, y, true, bary_divmod_normal);
 }
 
 #if USE_GMP
@@ -2855,35 +2864,154 @@ bary_divmod_gmp(BDIGIT *qds, size_t qn, BDIGIT *rds, size_t rn, const BDIGIT *xd
 VALUE
 rb_big_divrem_gmp(VALUE x, VALUE y)
 {
-    size_t xn = BIGNUM_LEN(x), yn = BIGNUM_LEN(y), qn, rn;
-    BDIGIT *xds = BDIGITS(x), *yds = BDIGITS(y), *qds, *rds;
-    VALUE q, r;
+    return rb_big_divrem_testing(x, y, false, bary_divmod_gmp);
+}
 
-    BARY_TRUNC(yds, yn);
-    if (yn == 0)
-        rb_num_zerodiv();
-    BARY_TRUNC(xds, xn);
+#else
 
-    if (xn < yn || (xn == yn && xds[xn - 1] < yds[yn - 1]))
-        return rb_assoc_new(LONG2FIX(0), x);
+/*
+ *  Calculates reciprocal of x with Newton's method
+ *  Returns `(1 << (bits + x.bit_length)) / x`. The last bit might not be accurate.
+ */
+static VALUE
+bary_divmod_newton_raphson_reciprocal(VALUE x, size_t bits)
+{
+    size_t xbits = NUM2SIZET(rb_big_bit_length(x));
+    size_t n = 2;
+    /* Initial reciprocal of x approximation in n bits: y = (1 << (n + x.bit_length)) / x */
+    VALUE y = INT2NUM((1 << (n + 2)) / NUM2SIZET(rb_int_rshift(x, SIZET2NUM(xbits - 2))));
 
-    qn = xn - yn + 1;
-    q = bignew(qn, BIGNUM_SIGN(x)==BIGNUM_SIGN(y));
-    qds = BDIGITS(q);
+    for (ssize_t i = bit_length(bits); i >= 0; i--) {
+        /*
+         * Reciprocal of x can be calculated with Newton's method
+         * by repeating InvX_next = InvX * (2 - x * InvX)
+         * where InvX is the current approximation of 1/x in n bits
+         *   InvX = y.quo(1 << (n + x.bit_length))
+         * and InvX_next is the next approximation of 1/x in n2 bits
+         *   InvX_next = y_next.quo(1 << (n2 + x.bit_length))
+         */
+        size_t n2 = (bits >> i) + 2;
+        if (n2 > bits) n2 = bits;
 
-    rn = yn;
-    r = bignew(rn, BIGNUM_SIGN(x));
-    rds = BDIGITS(r);
+        size_t x_shift = xbits > n2 ? xbits - n2 : 0;
+        y = rb_int_rshift(
+            rb_int_plus(
+                rb_int_lshift(y, SIZET2NUM(xbits + n - x_shift)),
+                rb_int_mul(
+                    rb_int_minus(
+                        rb_int_lshift(INT2NUM(1), SIZET2NUM(xbits + n - x_shift)),
+                        rb_int_mul(rb_int_rshift(x, SIZET2NUM(x_shift)), y)
+                    ),
+                    y
+                )
+            ),
+            SIZET2NUM(xbits + 2 * n - n2 - x_shift)
+        );
+        n = n2;
+    }
+    return y;
+}
 
-    bary_divmod_gmp(qds, qn, rds, rn, xds, xn, yds, yn);
+/* Calculates divmod by multiplying reciprocal of y */
+static void
+bary_divmod_newton_raphson_muldiv(VALUE *div, VALUE *mod, VALUE x, VALUE y, VALUE inv, size_t bits) {
+    /*
+     * inv = (1 << (bits + y.bit_length)) / y
+     * Approximate of x / y is ((x >> y.bit_length) * inv) >> bits
+     */
+    VALUE d = rb_int_rshift(rb_int_mul(rb_int_rshift(x, rb_big_bit_length(y)), inv), SIZET2NUM(bits));
+    VALUE m = rb_int_minus(x, rb_int_mul(d, y));
+    // Adjust mod to be within 0...y range to calculate correct divmod
+    while (rb_int_negative_p(m)) {
+        m = rb_int_plus(m, y);
+        d = rb_int_minus(d, INT2NUM(1));
+    }
+    while (rb_int_ge(m, y)) {
+        m = rb_int_minus(m, y);
+        d = rb_int_plus(d, INT2NUM(1));
+    }
+    *div = d;
+    *mod = m;
+}
 
-    bigtrunc(q);
-    bigtrunc(r);
+/* Calculates divmod using Newton-Raphson method */
+static void
+bary_divmod_newton_raphson(BDIGIT *qds, size_t qn, BDIGIT *rds, size_t rn, const BDIGIT *xds, size_t xn, const BDIGIT *yds, size_t yn)
+{
+    /*
+     * To calculate with low cost, we need to split x into blocks and perform divmod for each block.
+     * xbits = remaining_bits + block_bits * num_blocks
+     * remaining_bits: <=> ybits, larger is better
+     * block_bits: closer to ybits is better
+     *
+     * xxxxx_xxxx(9bits) / yyyyy(5bits)
+     * remaining_bits = 5, block_bits = 4, num_blocks = 1
+     * repeating xxxxx_xxxx.divmod(yyyyy) calculation 1 time.
+     *
+     * xxxx_xxxxx_xxxxx(10bits) / yyyyy(5bits)
+     * remaining_bits = 4, block_bits = 5, num_blocks = 2
+     * repeating xxxx_xxxxx.divmod(yyyyy) calculation 2 times.
+     *
+     * xxxxx_xxxxxx_xxxxxx_xxxxxx(23bits) / yyyyy(5bits) needs reciprocal of y with 6 bits precision
+     * remaining_bits = 3, block_bits = 5, num_blocks = 3
+     * repeating xxxxx_xxxxxx.divmod(yyyyy) calculation 3 times.
+     *
+     * In each divmod step, dividend is ybits+block_bits bits and divisor is ybits bits.
+     * Reciprocal of y needs block_bits precision.
+     */
+    size_t xbits, ybits, n, block_len, block_bits, num_blocks;
+    VALUE block_dividend, y, yinv;
 
-    RB_GC_GUARD(x);
-    RB_GC_GUARD(y);
+    RUBY_ASSERT(yn < xn || (xn == yn && yds[yn - 1] <= xds[xn - 1]));
+    RUBY_ASSERT(qds ? (xn - yn + 1) <= qn : 1);
+    RUBY_ASSERT(rds ? yn <= rn : 1);
 
-    return rb_assoc_new(q, r);
+    if (qds) MEMZERO(qds, BDIGIT, qn);
+    xbits = (xn - 1) * BITSPERDIG + bit_length(xds[xn - 1]);
+    ybits = (yn - 1) * BITSPERDIG + bit_length(yds[yn - 1]);
+
+    // For simplicity of copying BDIGITS, block_bits should be a multiple of BITSPERDIG
+    n = xbits / ybits;
+    block_len = (xbits - ybits) / n / BITSPERDIG + 1;
+    block_bits = block_len * BITSPERDIG;
+
+    // Calculate num_blocks to ensure remaining_bits <= ybits
+    num_blocks = (xbits - ybits + block_len * BITSPERDIG - 1) / (block_len * BITSPERDIG);
+    if (num_blocks == 0) num_blocks = 1;
+
+    y = bignew(yn, 1);
+    MEMCPY(BDIGITS(y), yds, BDIGIT, yn);
+    yinv = bary_divmod_newton_raphson_reciprocal(y, block_bits);
+
+    block_dividend = bignew(yn + block_len, 1);
+    BDIGIT *bds = BDIGITS(block_dividend);
+    MEMZERO(bds, BDIGIT, yn + block_len);
+    MEMCPY(bds, xds + (num_blocks - 1) * block_len, BDIGIT, xn - (num_blocks - 1) * block_len);
+
+    for (ssize_t i = num_blocks - 1; i >= 0; i--) {
+        VALUE div, mod;
+        bary_divmod_newton_raphson_muldiv(&div, &mod, block_dividend, y, yinv, block_bits);
+        if (FIXNUM_P(div)) div = rb_int2big(FIX2LONG(div));
+        if (FIXNUM_P(mod)) mod = rb_int2big(FIX2LONG(mod));
+        if (qds) MEMCPY(qds + i * block_len, BDIGITS(div), BDIGIT, BIGNUM_LEN(div));
+        if (i) {
+            MEMCPY(bds, xds + (i - 1) * block_len, BDIGIT, block_len);
+            MEMCPY(bds + block_len, BDIGITS(mod), BDIGIT, BIGNUM_LEN(mod));
+            MEMZERO(bds + block_len + BIGNUM_LEN(mod), BDIGIT, (yn - BIGNUM_LEN(mod)));
+        } else if (rds) {
+            MEMCPY(rds, BDIGITS(mod), BDIGIT, BIGNUM_LEN(mod));
+            MEMZERO(rds + BIGNUM_LEN(mod), BDIGIT, rn - BIGNUM_LEN(mod));
+        }
+        RB_GC_GUARD(div);
+        RB_GC_GUARD(mod);
+    }
+    RB_GC_GUARD(block_dividend);
+}
+
+VALUE
+rb_big_divrem_newton_raphson(VALUE x, VALUE y)
+{
+    return rb_big_divrem_testing(x, y, false, bary_divmod_newton_raphson);
 }
 #endif
 
@@ -2893,6 +3021,11 @@ bary_divmod_branch(BDIGIT *qds, size_t qn, BDIGIT *rds, size_t rn, const BDIGIT 
 #if USE_GMP
     if (GMP_DIV_DIGITS < xn) {
         bary_divmod_gmp(qds, qn, rds, rn, xds, xn, yds, yn);
+        return;
+    }
+#else
+    if (NEWTON_RAPHSON_DIV_X_DIGITS < xn && NEWTON_RAPHSON_DIV_Y_DIGITS < yn) {
+        bary_divmod_newton_raphson(qds, qn, rds, rn, xds, xn, yds, yn);
         return;
     }
 #endif
