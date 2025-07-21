@@ -33,6 +33,7 @@ class TestBignum_Div < Test::Unit::TestCase
         assert_operator(r, :<, y)
       end
     end
+    raise 'OK, test is running in CI'
   rescue NotImplementedError
   end
 
